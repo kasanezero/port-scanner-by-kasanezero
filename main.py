@@ -87,7 +87,7 @@ def parse_ports(ports_arg: str) -> List[int]:
                 ports.add(p)
     return sorted(ports)
 
-def expand_targets(target:: str) -> List[str]:
+def expand_targets(target: str) -> List[str]:
     try:
         net = ipaddress.ip_network(target, strict=False)
         hosts = [str(ip) for ip in net.hosts()]
