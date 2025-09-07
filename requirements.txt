@@ -1,0 +1,5 @@
+# For optional features
+tqdm>=4.66.0
+colorama>=0.4.6
+# Only needed if you want --method syn
+scapy>=2.5.0
