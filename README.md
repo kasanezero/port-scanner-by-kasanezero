@@ -1,4 +1,4 @@
-# 🔎 py-port-scanner (v0.3)
+# 🔎 port-scanner-by-kasanezero
 
 A lightweight and educational port scanner written in Python.  
 Simple alternative to **nmap**, supporting **TCP connect()**, **SYN**, and **UDP** scans.
@@ -64,8 +64,8 @@ python main.py scanme.nmap.org --no-save
 
 **Port profiles (no -p needed):**
 ```bash
-python main.py scanme.nmap.org --web           # 80,443,8080,8443,...
-python main.py db.internal --db                # 3306,5432,1433,6379,...
+python main.py scanme.nmap.org --web          
+python main.py db.internal --db        
 ```
 
 ---
@@ -80,7 +80,3 @@ python main.py db.internal --db                # 3306,5432,1433,6379,...
 - **Connect scan** / **UDP**: no special privileges.
 - **SYN scan**: requires raw sockets (admin/root).
 - Only scan systems you own or have permission to test. Use `scanme.nmap.org` for safe practice.
-
----
-
-## 📜 License
