@@ -1,15 +1,4 @@
 #!/usr/bin/env python3
-"""
-Simple Port Scanner v0.3
-- TCP connect() (default), TCP SYN (--method syn), UDP (--method udp)
-- Top-1000 preset (--top1000) and -p @file
-- NEW in v0.3:
-  * --open-only           : show/save only open ports (or open|filtered for UDP)
-  * Colored console output (requires colorama on Windows)
-  * Progress bar via tqdm
-  * --json-out / --csv-out: explicit output paths; --no-save to skip files
-  * Port profiles         : --web, --db
-"""
 
 import argparse
 import csv
@@ -21,7 +10,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Tuple
+from typing import List, Dict, Any, Tuple, Iterable
 
 # Optional imports (colorama/tqdm). Program still works if missing.
 try:
@@ -37,27 +26,34 @@ except Exception:
     _TQDM = False
 
 # Lazy import for scapy (only for --method syn)
+
 def _try_import_scapy():
     try:
         from scapy.all import IP, TCP, sr1, conf
         return IP, TCP, sr1, conf
-    except Exception as e:
+    except Exception:
         print("[!] Scapy is not available. Install it with `pip install scapy` and run with admin privileges.", file=sys.stderr)
         raise
 
-def _read_ports_file(path: str) -> str:
-    items = []
+
+def _read_list_file(path: str) -> List[str]:
+    items: List[str] = []
     with open(path, "r", encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
+            # allow comma-separated entries on a single line too
             parts = [p.strip() for p in line.split(",") if p.strip()]
             if parts:
                 items.extend(parts)
-            else:
-                items.append(line)
+    return items
+
+
+def _read_ports_file(path: str) -> str:
+    items = _read_list_file(path)
     return ",".join(items)
+
 
 def parse_ports(ports_arg: str) -> List[int]:
     if not ports_arg:
@@ -87,6 +83,21 @@ def parse_ports(ports_arg: str) -> List[int]:
                 ports.add(p)
     return sorted(ports)
 
+
+def parse_targets_arg(arg: str) -> List[str]:
+    """Parse host targets string which can be comma list or @file."""
+    if not arg:
+        return []
+    if arg.startswith("@"):
+        items = _read_list_file(arg[1:])
+    else:
+        items = [x.strip() for x in arg.split(",") if x.strip()]
+    result: List[str] = []
+    for item in items:
+        result.extend(expand_targets(item))
+    return sorted(set(result))
+
+
 def expand_targets(target: str) -> List[str]:
     try:
         net = ipaddress.ip_network(target, strict=False)
@@ -94,6 +105,7 @@ def expand_targets(target: str) -> List[str]:
         return hosts or [str(net.network_address)]
     except ValueError:
         return [target]
+
 
 def tcp_connect_scan(host: str, port: int, timeout: float = 1.0, banner: bool = False) -> Tuple[int, str]:
     try:
@@ -118,6 +130,7 @@ def tcp_connect_scan(host: str, port: int, timeout: float = 1.0, banner: bool = 
     except Exception:
         return port, "filtered"
 
+
 def tcp_syn_scan(host: str, port: int, timeout: float = 1.0) -> Tuple[int, str]:
     IP, TCP, sr1, conf = _try_import_scapy()
     conf.verb = 0
@@ -135,6 +148,7 @@ def tcp_syn_scan(host: str, port: int, timeout: float = 1.0) -> Tuple[int, str]:
         return port, "filtered"
     except Exception:
         return port, "filtered"
+
 
 def udp_scan(host: str, port: int, timeout: float = 1.0) -> Tuple[int, str]:
     try:
@@ -163,24 +177,36 @@ def udp_scan(host: str, port: int, timeout: float = 1.0) -> Tuple[int, str]:
     except Exception:
         return port, "filtered"
 
+
 def _is_open_state(state: str) -> bool:
     # Consider open or open|filtered as "openish" for UDP convenience
     return state.startswith("open")
 
-def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: bool, workers: int, show_progress: bool) -> List[Dict[str, Any]]:
+
+def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: bool, workers: int, show_progress: bool, retries: int) -> List[Dict[str, Any]]:
     if method == "connect":
-        scanner = lambda h, p: tcp_connect_scan(h, p, timeout, banner)
+        base_scanner = lambda h, p: tcp_connect_scan(h, p, timeout, banner)
         proto = "tcp"
     elif method == "syn":
-        scanner = lambda h, p: tcp_syn_scan(h, p, timeout)
+        base_scanner = lambda h, p: tcp_syn_scan(h, p, timeout)
         proto = "tcp"
     elif method == "udp":
-        scanner = lambda h, p: udp_scan(h, p, timeout)
+        base_scanner = lambda h, p: udp_scan(h, p, timeout)
         proto = "udp"
     else:
         raise ValueError(f"Unknown method: {method}")
 
-    results = []
+    def scanner_with_retry(h: str, p: int) -> Tuple[int, str]:
+        last_state = "filtered"
+        attempts = max(0, retries) + 1
+        for i in range(attempts):
+            port, state = base_scanner(h, p)
+            last_state = state
+            if state.startswith("open"):
+                break  # early success
+        return port, last_state
+
+    results: List[Dict[str, Any]] = []
     lock = threading.Lock()
 
     pbar = None
@@ -188,7 +214,7 @@ def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: 
         pbar = tqdm(total=len(ports), desc=f"{host} [{proto}]", unit="port")
 
     with ThreadPoolExecutor(max_workers=workers) as ex:
-        futures = {ex.submit(scanner, host, p): p for p in ports}
+        futures = {ex.submit(scanner_with_retry, host, p): p for p in ports}
         for fut in as_completed(futures):
             p, state = fut.result()
             with lock:
@@ -201,26 +227,37 @@ def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: 
     results.sort(key=lambda x: x["port"])
     return results
 
-def save_outputs(results: List[Dict[str, Any]], json_out: str = None, csv_out: str = None, out_prefix: str = None) -> Tuple[str, str]:
+
+def _timestamp() -> str:
+    return datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')
+
+
+def _ensure_dir(path: str):
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+
+
+def save_outputs(results: List[Dict[str, Any]], json_out: str = None, csv_out: str = None, ndjson_out: str = None, md_out: str = None, out_prefix: str = None) -> Tuple[str, str, str, str]:
     os.makedirs("data", exist_ok=True)
-    json_path = None
-    csv_path = None
+    json_path = csv_path = ndjson_path = md_path = None
 
     # Resolve outputs
-    if not (json_out or csv_out or out_prefix):
-        out_prefix = f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')}"
+    if not (json_out or csv_out or ndjson_out or md_out or out_prefix):
+        out_prefix = f"scan_{_timestamp()}"
 
-    if out_prefix and not json_out:
-        json_out = f"data/{out_prefix}.json"
-    if out_prefix and not csv_out:
-        csv_out = f"data/{out_prefix}.csv"
+    if out_prefix:
+        json_out = json_out or f"data/{out_prefix}.json"
+        csv_out = csv_out or f"data/{out_prefix}.csv"
+        ndjson_out = ndjson_out or None  # only if explicitly asked
+        md_out = md_out or None          # only if explicitly asked
 
     if json_out:
+        _ensure_dir(json_out)
         with open(json_out, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
         json_path = json_out
 
     if csv_out:
+        _ensure_dir(csv_out)
         with open(csv_out, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
             w.writerow(["host", "port", "proto", "state"])
@@ -228,7 +265,21 @@ def save_outputs(results: List[Dict[str, Any]], json_out: str = None, csv_out: s
                 w.writerow([r["host"], r["port"], r["proto"], r["state"]])
         csv_path = csv_out
 
-    return json_path, csv_path
+    if ndjson_out:
+        _ensure_dir(ndjson_out)
+        with open(ndjson_out, "w", encoding="utf-8") as f:
+            for r in results:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+        ndjson_path = ndjson_out
+
+    if md_out:
+        _ensure_dir(md_out)
+        with open(md_out, "w", encoding="utf-8") as f:
+            f.write(render_markdown_report(results))
+        md_path = md_out
+
+    return json_path, csv_path, ndjson_path, md_path
+
 
 def _colorize_state(state: str) -> str:
     if not _COLOR:
@@ -238,6 +289,7 @@ def _colorize_state(state: str) -> str:
     if state == "closed":
         return f"{Fore.RED}{state}{Style.RESET_ALL}"
     return f"{Fore.YELLOW}{state}{Style.RESET_ALL}"
+
 
 def print_table(results: List[Dict[str, Any]], open_only: bool = False):
     if not results:
@@ -260,6 +312,24 @@ def print_table(results: List[Dict[str, Any]], open_only: bool = False):
             state = _colorize_state(r["state"])
             print(f"{r['port']:<{width_port}}{r['proto']:<6}{state}")
 
+
+def render_markdown_report(results: List[Dict[str, Any]]) -> str:
+    if not results:
+        return "# Scan Report\n\n_No results._\n"
+    header = f"# Scan Report — {datetime.now(timezone.utc).isoformat()}\n\n"
+    by_host: Dict[str, List[Dict[str, Any]]] = {}
+    for r in results:
+        by_host.setdefault(r["host"], []).append(r)
+    parts: List[str] = [header]
+    for host, rows in by_host.items():
+        parts.append(f"## Host: `{host}`\n\n")
+        parts.append("| Port | Proto | State |\n|---:|:-----:|:------|\n")
+        for r in sorted(rows, key=lambda x: x["port"]):
+            parts.append(f"| {r['port']} | {r['proto']} | {r['state']} |\n")
+        parts.append("\n")
+    return "".join(parts)
+
+
 def _apply_profiles(args) -> str:
     """Return a ports string constructed from profiles/flags if applicable, else None."""
     profiles = []
@@ -271,15 +341,17 @@ def _apply_profiles(args) -> str:
         return ",".join(profiles)
     return None
 
+
 def main():
     parser = argparse.ArgumentParser(description="Simple Python Port Scanner (connect(), SYN, UDP)")
-    parser.add_argument("target", help="Target host/IP or CIDR (e.g., 192.168.1.0/24)")
+    parser.add_argument("target", help="Target host/IP or CIDR (e.g., 192.168.1.0/24) or comma list or @file")
 
     # Port sources
     parser.add_argument("-p", "--ports", default=None, help="Ports, e.g. '80,443,8000-8100' or '@data/list.txt'")
     parser.add_argument("--top1000", action="store_true", help="Use top-1000 TCP preset from data/top1000_tcp.txt")
     parser.add_argument("--web", action="store_true", help="Use a web profile (80,443,8080,8443,...)")
     parser.add_argument("--db", action="store_true", help="Use a database profile (3306,5432,1433,6379,...)")
+    parser.add_argument("--exclude-ports", default=None, help="Exclude ports, supports ranges and @file (e.g. '135-139,445' or '@skip.txt')")
 
     # Method & perf
     parser.add_argument("-m", "--method", choices=["connect", "syn", "udp"], default="connect", help="Scan method (default: connect)")
@@ -287,14 +359,20 @@ def main():
     parser.add_argument("-w", "--workers", type=int, default=200, help="Max concurrent workers (default 200)")
     parser.add_argument("--banner", action="store_true", help="Try to grab a short banner on open ports (connect scan only)")
     parser.add_argument("--progress", action="store_true", help="Show a progress bar (requires tqdm)")
+    parser.add_argument("--retries", type=int, default=0, help="Retry probes N times before finalizing state (default 0)")
 
     # Output controls
     parser.add_argument("--open-only", action="store_true", help="Show/save only open ports (and open|filtered for UDP)")
     parser.add_argument("--json-out", default=None, help="Explicit path to JSON output (e.g., data/scan.json)")
     parser.add_argument("--csv-out",  default=None, help="Explicit path to CSV output (e.g., data/scan.csv)")
+    parser.add_argument("--ndjson-out", default=None, help="Explicit path to NDJSON output (e.g., data/scan.ndjson)")
+    parser.add_argument("--md-out", default=None, help="Explicit path to Markdown report (e.g., reports/scan.md)")
     parser.add_argument("--no-save", action="store_true", help="Do not save any output files")
 
     parser.add_argument("-o", "--out", default=None, help="Output prefix for files in ./data (default auto with timestamp)")
+
+    # Host exclusions
+    parser.add_argument("--exclude-hosts", default=None, help="Exclude hosts/CIDRs (comma list or @file)")
 
     args = parser.parse_args()
 
@@ -308,18 +386,40 @@ def main():
         ports_arg = "1-1024"
 
     ports = parse_ports(ports_arg)
-    targets = expand_targets(args.target)
+
+    # Exclude ports if requested
+    if args.exclude_ports:
+        exclude_ports = set(parse_ports(args.exclude_ports))
+        ports = [p for p in ports if p not in exclude_ports]
+        if not ports:
+            print("[!] After exclusions, no ports left to scan.", file=sys.stderr)
+            sys.exit(1)
+
+    # Targets expand (and exclusions)
+    all_targets: List[str] = []
+    # Support comma list/@file in positional target
+    all_targets.extend(parse_targets_arg(args.target))
+    if not all_targets:
+        print("[!] No valid targets.", file=sys.stderr)
+        sys.exit(1)
+
+    if args.exclude_hosts:
+        excluded = set(parse_targets_arg(args.exclude_hosts))
+        all_targets = [h for h in all_targets if h not in excluded]
+        if not all_targets:
+            print("[!] After host exclusions, no targets left.", file=sys.stderr)
+            sys.exit(1)
 
     if args.method in ("syn", "udp") and args.banner:
         print("[!] --banner is ignored for this scan method.", file=sys.stderr)
 
     all_results: List[Dict[str, Any]] = []
-    for host in targets:
+    for host in all_targets:
         try:
             socket.gethostbyname(host)
         except Exception:
             pass
-        host_results = scan_host(host, ports, args.method, args.timeout, args.banner, args.workers, args.progress)
+        host_results = scan_host(host, ports, args.method, args.timeout, args.banner, args.workers, args.progress, args.retries)
         all_results.extend(host_results)
 
     # Optional filter before saving/printing
@@ -332,13 +432,16 @@ def main():
     if not args.no_save:
         json_out = args.json_out
         csv_out = args.csv_out
-        prefix = None if (json_out or csv_out) else (args.out or f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')}")
-        jp, cp = save_outputs(filtered_results, json_out=json_out, csv_out=csv_out, out_prefix=prefix)
-        saved = " and ".join(p for p in [jp, cp] if p)
+        ndjson_out = args.ndjson_out
+        md_out = args.md_out
+        prefix = None if (json_out or csv_out or ndjson_out or md_out) else (args.out or f"scan_{_timestamp()}")
+        jp, cp, np, mp = save_outputs(filtered_results, json_out=json_out, csv_out=csv_out, ndjson_out=ndjson_out, md_out=md_out, out_prefix=prefix)
+        saved = " and ".join(p for p in [jp, cp, np, mp] if p)
         if saved:
             print(f"\nSaved: {saved}")
     else:
-        print("\n(No files saved; use --json-out/--csv-out or -o PREFIX to save results.)")
+        print("\n(No files saved; use --json-out/--csv-out/--ndjson-out/--md-out or -o PREFIX to save results.)")
+
 
 if __name__ == "__main__":
     main()
