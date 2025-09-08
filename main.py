@@ -10,7 +10,7 @@ import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone
-from typing import List, Dict, Any, Tuple, Iterable
+from typing import List, Dict, Any, Tuple
 
 # Optional imports (colorama/tqdm). Program still works if missing.
 try:
@@ -25,8 +25,7 @@ try:
 except Exception:
     _TQDM = False
 
-# Lazy import for scapy (only for --method syn)
-
+# Lazy import for scapy (for SYN/flag scans)
 def _try_import_scapy():
     try:
         from scapy.all import IP, TCP, sr1, conf
@@ -43,7 +42,6 @@ def _read_list_file(path: str) -> List[str]:
             line = line.strip()
             if not line or line.startswith("#"):
                 continue
-            # allow comma-separated entries on a single line too
             parts = [p.strip() for p in line.split(",") if p.strip()]
             if parts:
                 items.extend(parts)
@@ -134,17 +132,42 @@ def tcp_connect_scan(host: str, port: int, timeout: float = 1.0, banner: bool = 
 def tcp_syn_scan(host: str, port: int, timeout: float = 1.0) -> Tuple[int, str]:
     IP, TCP, sr1, conf = _try_import_scapy()
     conf.verb = 0
-    pkt = IP(dst=host)/TCP(dport=port, flags="S")
+    pkt = IP(dst=host) / TCP(dport=port, flags="S")
     try:
         resp = sr1(pkt, timeout=timeout)
         if resp is None:
             return port, "filtered"
         if resp.haslayer(TCP):
             flags = resp.getlayer(TCP).flags
-            if flags & 0x12 == 0x12:
+            if flags & 0x12 == 0x12:  # SYN/ACK
                 return port, "open"
-            if flags & 0x04:
+            if flags & 0x04:          # RST
                 return port, "closed"
+        return port, "filtered"
+    except Exception:
+        return port, "filtered"
+
+
+# NEW: TCP NULL/FIN/Xmas/ACK scans (Scapy)
+def tcp_flag_scan(host: str, port: int, kind: str, timeout: float = 1.0) -> Tuple[int, str]:
+    IP, TCP, sr1, conf = _try_import_scapy()
+    conf.verb = 0
+    flags_map = {"null": 0, "fin": 0x01, "xmas": 0x29, "ack": 0x10}  # FIN+PSH+URG=0x29
+    fl = flags_map[kind]
+    pkt = IP(dst=host) / TCP(dport=port, flags=fl)
+    try:
+        resp = sr1(pkt, timeout=timeout)
+        if resp is None:
+            # класична інтерпретація: NULL/FIN/Xmas -> open|filtered; ACK -> filtered
+            return port, ("open|filtered" if kind in ("null", "fin", "xmas") else "filtered")
+        if resp.haslayer(TCP):
+            rflags = resp.getlayer(TCP).flags
+            if kind in ("null", "fin", "xmas"):
+                # Отримали RST -> closed; інакше open|filtered
+                return port, ("closed" if (rflags & 0x04) else "open|filtered")
+            else:  # ACK
+                # ACK-скан: RST => unfiltered; відсутність RST => filtered
+                return port, ("unfiltered" if (rflags & 0x04) else "filtered")
         return port, "filtered"
     except Exception:
         return port, "filtered"
@@ -183,12 +206,24 @@ def _is_open_state(state: str) -> bool:
     return state.startswith("open")
 
 
-def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: bool, workers: int, show_progress: bool, retries: int) -> List[Dict[str, Any]]:
+def scan_host(
+    host: str,
+    ports: List[int],
+    method: str,
+    timeout: float,
+    banner: bool,
+    workers: int,
+    show_progress: bool,
+    retries: int,
+) -> List[Dict[str, Any]]:
     if method == "connect":
         base_scanner = lambda h, p: tcp_connect_scan(h, p, timeout, banner)
         proto = "tcp"
     elif method == "syn":
         base_scanner = lambda h, p: tcp_syn_scan(h, p, timeout)
+        proto = "tcp"
+    elif method in ("null", "fin", "xmas", "ack"):
+        base_scanner = lambda h, p: tcp_flag_scan(h, p, method, timeout)
         proto = "tcp"
     elif method == "udp":
         base_scanner = lambda h, p: udp_scan(h, p, timeout)
@@ -199,11 +234,11 @@ def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: 
     def scanner_with_retry(h: str, p: int) -> Tuple[int, str]:
         last_state = "filtered"
         attempts = max(0, retries) + 1
-        for i in range(attempts):
+        for _ in range(attempts):
             port, state = base_scanner(h, p)
             last_state = state
-            if state.startswith("open"):
-                break  # early success
+            if state.startswith("open") or method == "ack":
+                break  # early success (or ACK got RST/unfiltered)
         return port, last_state
 
     results: List[Dict[str, Any]] = []
@@ -229,14 +264,21 @@ def scan_host(host: str, ports: List[int], method: str, timeout: float, banner: 
 
 
 def _timestamp() -> str:
-    return datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')
+    return datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%SUTC")
 
 
 def _ensure_dir(path: str):
     os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
 
 
-def save_outputs(results: List[Dict[str, Any]], json_out: str = None, csv_out: str = None, ndjson_out: str = None, md_out: str = None, out_prefix: str = None) -> Tuple[str, str, str, str]:
+def save_outputs(
+    results: List[Dict[str, Any]],
+    json_out: str = None,
+    csv_out: str = None,
+    ndjson_out: str = None,
+    md_out: str = None,
+    out_prefix: str = None,
+) -> Tuple[str, str, str, str]:
     os.makedirs("data", exist_ok=True)
     json_path = csv_path = ndjson_path = md_path = None
 
@@ -343,7 +385,7 @@ def _apply_profiles(args) -> str:
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Simple Python Port Scanner (connect(), SYN, UDP)")
+    parser = argparse.ArgumentParser(description="Simple Python Port Scanner (connect(), SYN, UDP, NULL/FIN/Xmas/ACK)")
     parser.add_argument("target", help="Target host/IP or CIDR (e.g., 192.168.1.0/24) or comma list or @file")
 
     # Port sources
@@ -354,7 +396,12 @@ def main():
     parser.add_argument("--exclude-ports", default=None, help="Exclude ports, supports ranges and @file (e.g. '135-139,445' or '@skip.txt')")
 
     # Method & perf
-    parser.add_argument("-m", "--method", choices=["connect", "syn", "udp"], default="connect", help="Scan method (default: connect)")
+    parser.add_argument(
+        "-m", "--method",
+        choices=["connect", "syn", "udp", "null", "fin", "xmas", "ack"],
+        default="connect",
+        help="Scan method (connect/syn/udp/null/fin/xmas/ack; default: connect)"
+    )
     parser.add_argument("-t", "--timeout", type=float, default=1.0, help="Per-port timeout in seconds (default 1.0)")
     parser.add_argument("-w", "--workers", type=int, default=200, help="Max concurrent workers (default 200)")
     parser.add_argument("--banner", action="store_true", help="Try to grab a short banner on open ports (connect scan only)")
@@ -397,7 +444,6 @@ def main():
 
     # Targets expand (and exclusions)
     all_targets: List[str] = []
-    # Support comma list/@file in positional target
     all_targets.extend(parse_targets_arg(args.target))
     if not all_targets:
         print("[!] No valid targets.", file=sys.stderr)
@@ -410,7 +456,8 @@ def main():
             print("[!] After host exclusions, no targets left.", file=sys.stderr)
             sys.exit(1)
 
-    if args.method in ("syn", "udp") and args.banner:
+    # Banner not applicable for SYN/UDP/flag scans
+    if args.method in ("syn", "udp", "null", "fin", "xmas", "ack") and args.banner:
         print("[!] --banner is ignored for this scan method.", file=sys.stderr)
 
     all_results: List[Dict[str, Any]] = []
@@ -419,7 +466,10 @@ def main():
             socket.gethostbyname(host)
         except Exception:
             pass
-        host_results = scan_host(host, ports, args.method, args.timeout, args.banner, args.workers, args.progress, args.retries)
+        host_results = scan_host(
+            host, ports, args.method, args.timeout, args.banner,
+            args.workers, args.progress, args.retries
+        )
         all_results.extend(host_results)
 
     # Optional filter before saving/printing
@@ -435,7 +485,10 @@ def main():
         ndjson_out = args.ndjson_out
         md_out = args.md_out
         prefix = None if (json_out or csv_out or ndjson_out or md_out) else (args.out or f"scan_{_timestamp()}")
-        jp, cp, np, mp = save_outputs(filtered_results, json_out=json_out, csv_out=csv_out, ndjson_out=ndjson_out, md_out=md_out, out_prefix=prefix)
+        jp, cp, np, mp = save_outputs(
+            filtered_results,
+            json_out=json_out, csv_out=csv_out, ndjson_out=ndjson_out, md_out=md_out, out_prefix=prefix
+        )
         saved = " and ".join(p for p in [jp, cp, np, mp] if p)
         if saved:
             print(f"\nSaved: {saved}")
