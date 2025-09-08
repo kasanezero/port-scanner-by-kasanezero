@@ -15,7 +15,7 @@ Simple alternative to **nmap**, supporting **TCP connect()**, **SYN**, and **UDP
 ---
 
 ## 📥 Installation
-
+Download ZIP-archive manually.
 ```bash
 python -m venv .venv
 # Windows PowerShell:
