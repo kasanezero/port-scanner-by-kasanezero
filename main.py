@@ -20,7 +20,7 @@ import socket
 import sys
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import List, Dict, Any, Tuple
 
 # Optional imports (colorama/tqdm). Program still works if missing.
@@ -208,7 +208,7 @@ def save_outputs(results: List[Dict[str, Any]], json_out: str = None, csv_out: s
 
     # Resolve outputs
     if not (json_out or csv_out or out_prefix):
-        out_prefix = f"scan_{datetime.utcnow().strftime('%Y%m%d_%H%M%SUTC')}"
+        out_prefix = f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')}"
 
     if out_prefix and not json_out:
         json_out = f"data/{out_prefix}.json"
@@ -332,7 +332,7 @@ def main():
     if not args.no_save:
         json_out = args.json_out
         csv_out = args.csv_out
-        prefix = None if (json_out or csv_out) else (args.out or f"scan_{datetime.utcnow().strftime('%Y%m%d_%H%M%SUTC')}")
+        prefix = None if (json_out or csv_out) else (args.out or f"scan_{datetime.now(timezone.utc).strftime('%Y%m%d_%H%M%SUTC')}")
         jp, cp = save_outputs(filtered_results, json_out=json_out, csv_out=csv_out, out_prefix=prefix)
         saved = " and ".join(p for p in [jp, cp] if p)
         if saved:
