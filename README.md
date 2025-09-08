@@ -84,4 +84,3 @@ python main.py db.internal --db                # 3306,5432,1433,6379,...
 ---
 
 ## 📜 License
-MIT
